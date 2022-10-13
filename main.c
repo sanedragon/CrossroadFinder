@@ -1,9 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <pthread.h>
 
 #include "fortressgenerator/FortressGenerator.h"
 #include "util/Inputs.h"
+
+#define INT_MAX 2147483647
+#define INT_MIN -2147483648
 
 typedef enum {
     DOUBLE = 0,
@@ -229,6 +233,7 @@ typedef struct {
     int searchRadius;
     int searchCenterX;
     int searchCenterZ;
+    int threadCount;
 } InputData;
 
 void processRegion(InputData *inputData, FortressGenerator *fortressGenerator, int32_t regionX, int32_t regionZ) {
@@ -327,31 +332,88 @@ int getInputData(InputData *inputData) {
         return 0;
     }
 
+    if (!getIntNormal("number of threads to use", &inputData->threadCount, 1, 1, 1, 10000)) {
+        return 0;
+    }
+
     return 1;
 }
 
+InputData inputData;
+int32_t regionSize;
+int32_t regionRadius;
+int32_t regionCenterX;
+int32_t regionCenterZ;
+int32_t regionMinX;
+int32_t regionMaxX;
+int32_t regionMinZ;
+int32_t regionMaxZ;
+int32_t currentRegionX;
+int32_t currentRegionZ;
+
+pthread_mutex_t regionSelectLock;
+
+/* This is the one critical section of code that needs a lock */
+bool selectNextRegion(Offset *output) {
+    pthread_mutex_lock(&regionSelectLock);
+
+    if(currentRegionX > regionMaxX) {
+        /* if x coordinate is out of bounds, exit */
+        pthread_mutex_unlock(&regionSelectLock);
+        return false;
+    }
+    output->x = currentRegionX;
+    output->z = currentRegionZ;
+
+    if(currentRegionZ >= regionMaxZ) {
+        currentRegionZ = regionMinZ;
+        currentRegionX++;
+    } else {
+        currentRegionZ++;
+    }
+
+    pthread_mutex_unlock(&regionSelectLock);
+
+    return true;
+}
+
+void *thread_main(void *unused) {
+    FortressGenerator fortressGenerator;
+
+    Offset region;
+    while(selectNextRegion(&region)) {
+        processRegion(&inputData, &fortressGenerator, region.x, region.z);
+    }
+    return NULL;
+}
+
 int main() {
-    InputData inputData;
 
     if (getInputData(&inputData)) {
-        FortressGenerator fortressGenerator;
+        regionSize = fortressGenerator_getRegionSize(inputData.version);
 
-        int32_t regionSize = fortressGenerator_getRegionSize(inputData.version);
+        regionRadius = inputData.searchRadius / regionSize / 16 + 1;
+        regionCenterX = inputData.searchCenterX / regionSize / 16;
+        regionCenterZ = inputData.searchCenterZ / regionSize / 16;
 
-        int32_t regionRadius = inputData.searchRadius / regionSize / 16 + 1;
-        int32_t regionCenterX = inputData.searchCenterX / regionSize / 16;
-        int32_t regionCenterZ = inputData.searchCenterZ / regionSize / 16;
+        regionMinX = regionCenterX - regionRadius;
+        regionMaxX = regionCenterX + regionRadius;
+        regionMinZ = regionCenterZ - regionRadius;
+        regionMaxZ = regionCenterZ + regionRadius;
 
-        int32_t regionMinX = regionCenterX - regionRadius;
-        int32_t regionMaxX = regionCenterX + regionRadius;
-        int32_t regionMinZ = regionCenterZ - regionRadius;
-        int32_t regionMaxZ = regionCenterZ + regionRadius;
+        currentRegionX = regionMinX;
+        currentRegionZ = regionMinZ;
 
-        for(int32_t regionX = regionMinX; regionX <= regionMaxX; regionX++) {
-            for(int32_t regionZ = regionMinZ; regionZ <= regionMaxZ; regionZ++) {
-                processRegion(&inputData, &fortressGenerator, regionX, regionZ);
-            }
+        pthread_mutex_init(&regionSelectLock, NULL);
+
+        pthread_t *threads = calloc(inputData.threadCount, sizeof(pthread_t));
+	for(int32_t i = 0; i < inputData.threadCount; i++) {
+            pthread_create(threads + i, NULL, thread_main, NULL);
         }
+	for(int32_t i = 0; i < inputData.threadCount; i++) {
+            pthread_join(threads[i], NULL);
+        }
+	pthread_mutex_destroy(&regionSelectLock);
     }
 
     system("pause");
